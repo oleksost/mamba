@@ -12,6 +12,7 @@ from einops import rearrange, repeat
 from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
 from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput, TextStreamer
+from transformers.generation.logits_process import LogitsProcessorList
 
 
 @dataclass
@@ -80,11 +81,12 @@ def modify_logit_for_repetition_penalty(logits, prev_output_tokens, repetition_p
     return logits
 
 
-def sample(logits, top_k=1, top_p=0.0, min_p=0.0, temperature=1.0):
+def sample(logits, top_k=1, top_p=0.0, min_p=0.0, temperature=1.0, logits_processor=None):
     """Sample from top-k logits.
     Arguments:
         logits: Tensor of shape (batch_size, vocab_size)
     """
+
     if top_k == 1:  # Short-circuit for greedy decoding
         return logits.argmax(dim=-1)
     else:
@@ -133,7 +135,9 @@ def decode(
     cg=False,
     enable_timing=False,
     output_scores=False,
-    streamer: Optional[TextStreamer] = None
+    streamer: Optional[TextStreamer] = None,
+    logits_processor: Optional[LogitsProcessorList] = None,
+    **kwargs,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -143,7 +147,7 @@ def decode(
 
     Arguments:
         input_ids: (batch, seq_len)
-        max_length: int
+        max_length: int, this includes the input sequence length
         teacher_outputs (optional): (batch, seq_len). If provided, instead of sampling from the
             logits, the next token is taken from the teacher_outputs. Useful for testing.
     Returns: GreedySearchDecoderOnlyOutput or SampleDecoderOnlyOutput, with the following fields:
@@ -153,6 +157,7 @@ def decode(
     if streamer is not None:
         streamer.put(input_ids.cpu())
 
+    min_length = kwargs.get("min_new_tokens", 0)
     batch_size, seqlen_og = input_ids.shape
     teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
@@ -192,7 +197,10 @@ def decode(
             logits = model._decoding_cache.run(
                 input_ids, position_ids, inference_params.seqlen_offset
             ).squeeze(dim=1)
-        return logits[..., :vocab_size] if vocab_size is not None else logits
+        logits = logits_processor(input_ids, logits) if logits_processor is not None else logits
+        # added logits_processor to work with optimum-benchmark. 
+        # logits_processor is a list of logits processors, we only use the first one here.
+        return logits_processor[0](input_ids, logits) if logits_processor is not None else logits
 
     def sample_tokens(logits, inference_params):
         if teacher_outputs is None or teacher_output_len <= inference_params.seqlen_offset:
@@ -201,13 +209,22 @@ def decode(
             token = teacher_outputs[:, inference_params.seqlen_offset]
         # return rearrange(token, "b -> b 1")
         return token.unsqueeze(1)
-
+    stopped = False
     def should_stop(current_token, inference_params):
+        nonlocal stopped
         if inference_params.seqlen_offset == 0:
             return False
         if eos_token_id is not None and (current_token == eos_token_id).all():
+            stopped = True
+            if n_generated_tokens < min_length:
+                return False
             return True
         if inference_params.seqlen_offset >= max_length - 1:
+            stopped = True
+            return True        
+        if n_generated_tokens < min_length:
+            return False
+        if stopped:
             return True
         return False
 
@@ -218,6 +235,7 @@ def decode(
         start.record()
     scores, sequences = [], [input_ids]
     sequences_cat = input_ids
+    n_generated_tokens = 0
     while not should_stop(sequences[-1], inference_params):
         logits = get_logits(sequences[-1], inference_params)
         if output_scores:
@@ -234,6 +252,7 @@ def decode(
         sequences.append(sampled_tokens)
         if streamer is not None:
             streamer.put(sampled_tokens.cpu())
+        n_generated_tokens += sampled_tokens.shape[1]
     if streamer is not None:
         streamer.end()
     if enable_timing:
@@ -258,10 +277,11 @@ class GenerationMixin:
         temperature=1.0,
         return_dict_in_generate=False,
         output_scores=False,
+        logits_processor: Optional[LogitsProcessorList] = None,
         **kwargs,
-    ):
+    ):  
         output = decode(
-            input_ids, self, max_length, top_k=top_k, top_p=top_p, min_p = min_p, temperature=temperature, output_scores=output_scores, **kwargs
+            input_ids, self, max_length, top_k=top_k, top_p=top_p, min_p = min_p, temperature=temperature, output_scores=output_scores, logits_processor=logits_processor, **kwargs
         )
         if not output_scores:
             output.scores = None

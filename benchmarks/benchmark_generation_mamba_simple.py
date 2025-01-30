@@ -15,7 +15,7 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
-parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
+parser.add_argument("--model-name", type=str, default="state-spaces/mamba2-2.7b")
 parser.add_argument("--prompt", type=str, default=None)
 parser.add_argument("--promptlen", type=int, default=100)
 parser.add_argument("--genlen", type=int, default=100)
